@@ -3810,6 +3810,34 @@ estimate_hashagg_tablesize(Path *path, const AggClauseCosts *agg_costs,
     return hashentrysize * dNumGroups;
 }
 
+#ifdef __TBASE__
+Size
+estimate_hashagg_entrysize(Path *path, const AggClauseCosts *agg_costs,
+						   double dNumGroups)
+{
+	Size		hashentrysize;
+
+	/* Estimate per-hash-entry space at tuple width... */
+	hashentrysize = MAXALIGN(path->pathtarget->width) +
+		MAXALIGN(SizeofMinimalTupleHeader);
+
+	/* plus space for pass-by-ref transition values... */
+	if (agg_costs)
+	{
+		hashentrysize += agg_costs->transitionSpace;
+		/* plus the per-hash-entry overhead */
+		hashentrysize += hash_agg_entry_size(agg_costs->numAggs);
+	}
+	else
+	{
+		hashentrysize += hash_agg_entry_size(0);
+	}
+	
+	return hashentrysize;
+}
+
+#endif
+
 /*
  * create_grouping_paths
  *
@@ -4180,9 +4208,13 @@ create_grouping_paths(PlannerInfo *root,
              * Tentatively produce a partial HashAgg Path, depending on if it
              * looks as if the hash table will fit in work_mem.
              */
+#ifdef __TBASE__
+			if (hashaggtablesize < work_mem * 1024L || g_hybrid_hash_agg)
+#else
             if (hashaggtablesize < work_mem * 1024L)
+#endif
             {
-                add_partial_path(grouped_rel, (Path *)
+				AggPath *aggpath = (AggPath *)
                                  create_agg_path(root,
                                                  grouped_rel,
                                                  cheapest_partial_path,
@@ -4192,11 +4224,27 @@ create_grouping_paths(PlannerInfo *root,
                                                  parse->groupClause,
                                                  NIL,
                                                  &agg_partial_costs,
-                                                 dNumPartialGroups));
+												 dNumPartialGroups);
+#ifdef __TBASE__
+				if (hashaggtablesize >= work_mem * 1024L)
+				{
+					aggpath->hybrid = true;
+				}
+#endif
+				add_partial_path(grouped_rel, (Path *)aggpath);
             }
         }
     }
-
+#ifdef __TBASE__
+	else
+	{
+		if (g_hybrid_hash_agg)
+		{
+			agg_partial_costs = *agg_costs;
+			agg_final_costs = *agg_costs;
+		}
+	}
+#endif
     /*
      * XL: To minimize the code complexity in general (and diff compared to
      * PostgreSQL code base), XL generates the paths in two phases.
@@ -4300,14 +4348,17 @@ create_grouping_paths(PlannerInfo *root,
                         else
                             path = create_remotesubplan_path(root, path, NULL);
 
-                        if (!is_sorted && agg_costs->hasOnlyDistinct && olap_optimizer &&
+						if (agg_costs->hasOnlyDistinct && olap_optimizer &&
                             !has_cold_hot_table)
                         {
-                            path = (Path *) create_sort_path(root,
-                                             grouped_rel,
-                                             path,
-                                             root->group_pathkeys,
-                                             -1.0);
+							if (root->group_pathkeys)
+							{
+								path = (Path *) create_sort_path(root,
+												 grouped_rel,
+												 path,
+												 root->group_pathkeys,
+												 -1.0);
+							}
                         }
                     }
                     else
@@ -4445,6 +4496,11 @@ create_grouping_paths(PlannerInfo *root,
                                                      &agg_final_costs,
                                                      dNumGroups);
                             //path->parallel_safe = true;
+							if (g_hybrid_hash_agg)
+							{
+								AggPath *agg = (AggPath *)path;
+								agg->hybrid = true;
+							}
                             
                             add_path(grouped_rel, path);
                         }
@@ -4502,6 +4558,20 @@ create_grouping_paths(PlannerInfo *root,
                     bool parallel_safe  = false;
                     Path *agg_path      = NULL;
 
+					if (root->group_pathkeys && olap_optimizer && 
+						!has_cold_hot_table && agg_costs->hasOnlyDistinct)
+					{
+						if (!pathkeys_contained_in(root->group_pathkeys,
+											  path->pathkeys))
+						{
+							path = (Path *) create_sort_path(root,
+											 grouped_rel,
+											 path,
+											 root->group_pathkeys,
+											 -1.0);
+					  	}
+					}
+
                     if (path->pathtype == T_Sort && olap_optimizer && !has_cold_hot_table)
                     {
                         SortPath   *pathnode = (SortPath *)path;
@@ -4553,6 +4623,20 @@ create_grouping_paths(PlannerInfo *root,
                     bool parallel_aware = false;
                     bool parallel_safe    = false;
                     Path *group_path      = NULL;
+
+					if (root->group_pathkeys && olap_optimizer && 
+						!has_cold_hot_table && agg_costs->hasOnlyDistinct)
+					{
+						if (!pathkeys_contained_in(root->group_pathkeys,
+											  path->pathkeys))
+						{
+							path = (Path *) create_sort_path(root,
+											 grouped_rel,
+											 path,
+											 root->group_pathkeys,
+											 -1.0);
+					  	}
+					}
 
                     if (path->pathtype == T_Sort && olap_optimizer && !has_cold_hot_table)
                     {
@@ -4919,8 +5003,13 @@ create_grouping_paths(PlannerInfo *root,
              * were unable to sort above, then we'd better generate a Path, so
              * that we at least have one.
              */
+#ifdef __TBASE__
+			if (hashaggtablesize < work_mem * 1024L || g_hybrid_hash_agg ||
+				grouped_rel->pathlist == NIL)
+#else
             if (hashaggtablesize < work_mem * 1024L ||
                 grouped_rel->pathlist == NIL)
+#endif
             {
                 /* Don't mess with the cheapest path directly. */
                 Path *path = cheapest_path;
@@ -4958,6 +5047,7 @@ create_grouping_paths(PlannerInfo *root,
                           * 2. re-distribute grouping results among datanodes, then do the 
                           *     final grouping
                                         */
+						AggClauseCosts hashagg_partial_costs;
                         PathTarget * local_grouping_target = make_partial_grouping_target(root, target);
 
                         /* Estimate number of partial groups. */
@@ -4965,6 +5055,12 @@ create_grouping_paths(PlannerInfo *root,
                                                                  cheapest_path->rows,
                                                                  gd);
                         try_redistribute_grouping = true;
+
+						MemSet(&hashagg_partial_costs, 0, sizeof(AggClauseCosts));
+				
+						get_agg_clause_costs(root, (Node *) local_grouping_target->exprs,
+								 AGGSPLIT_INITIAL_SERIAL,
+								 &hashagg_partial_costs);
                         
                         /* step 1 */
                         path = (Path *) create_agg_path(root,
@@ -4975,8 +5071,18 @@ create_grouping_paths(PlannerInfo *root,
                                                         AGGSPLIT_INITIAL_SERIAL,
                                                         parse->groupClause,
                                                         NIL,
-                                                        &agg_partial_costs,
+														&hashagg_partial_costs,
                                                         dNumLocalGroups);
+
+#ifdef __TBASE__
+						if (hashaggtablesize >= work_mem * 1024L && g_hybrid_hash_agg)
+						{
+							AggPath *aggpath = (AggPath *)path;
+
+							aggpath->hybrid = true;
+						}
+#endif
+
                         /* step 2 */
                         path = create_redistribute_grouping_path(root, parse, path);
                     }
@@ -4994,7 +5100,19 @@ create_grouping_paths(PlannerInfo *root,
 #ifdef __TBASE__
                 if(try_redistribute_grouping)
                 {
-                    Path *agg_path = (Path *)
+					AggClauseCosts hashagg_final_costs;
+					Path *agg_path;
+
+					MemSet(&hashagg_final_costs, 0, sizeof(AggClauseCosts));
+
+					get_agg_clause_costs(root, (Node *) target->exprs,
+								 AGGSPLIT_FINAL_DESERIAL,
+								 &hashagg_final_costs);
+					get_agg_clause_costs(root, parse->havingQual,
+								 AGGSPLIT_FINAL_DESERIAL,
+								 &hashagg_final_costs);
+											
+					agg_path = (Path *)
                                  create_agg_path(root,
                                                  grouped_rel,
                                                  path,
@@ -5003,9 +5121,16 @@ create_grouping_paths(PlannerInfo *root,
                                                  AGGSPLIT_FINAL_DESERIAL,
                                                  parse->groupClause,
                                                  (List *) parse->havingQual,
-                                                 &agg_final_costs,
+												 &hashagg_final_costs,
                                                  dNumGroups);
+#ifdef __TBASE__
+					if (hashaggtablesize >= work_mem * 1024L && g_hybrid_hash_agg)
+					{
+						AggPath *aggpath = (AggPath *)agg_path;
 
+						aggpath->hybrid = true;
+					}
+#endif
                     //agg_path->parallel_safe = true;
                     
                     add_path(grouped_rel, agg_path);
@@ -5035,6 +5160,14 @@ create_grouping_paths(PlannerInfo *root,
                                          dNumGroups);
                     agg_path->parallel_aware = parallel_aware;
                     agg_path->parallel_safe  = parallel_safe;
+#ifdef __TBASE__
+					if (hashaggtablesize >= work_mem * 1024L && g_hybrid_hash_agg)
+					{
+						AggPath *aggpath = (AggPath *)agg_path;
+
+						aggpath->hybrid = true;
+					}
+#endif
                     add_path(grouped_rel, agg_path);
                 }
 #else
@@ -5066,7 +5199,11 @@ create_grouping_paths(PlannerInfo *root,
                                                           &agg_final_costs,
                                                           dNumGroups);
 
+#ifdef __TBASE__
+			if (hashaggtablesize < work_mem * 1024L || g_hybrid_hash_agg)
+#else
             if (hashaggtablesize < work_mem * 1024L)
+#endif
             {
 #ifdef __TBASE__
                 double        total_groups = 0;
@@ -5134,7 +5271,14 @@ create_grouping_paths(PlannerInfo *root,
                         agg_path->parallel_aware = true;
                         agg_path->parallel_safe  = true;
                     }
+#ifdef __TBASE__
+					if (hashaggtablesize >= work_mem * 1024L && g_hybrid_hash_agg)
+					{
+						AggPath *aggpath = (AggPath *)agg_path;
 
+						aggpath->hybrid = true;
+					}
+#endif
                     add_path(grouped_rel, agg_path);
                 }
                 else
@@ -5157,7 +5301,14 @@ create_grouping_paths(PlannerInfo *root,
                     agg_path->parallel_aware = true;
                     agg_path->parallel_safe = true;
                 }
-                
+#ifdef __TBASE__
+				if (hashaggtablesize >= work_mem * 1024L && g_hybrid_hash_agg)
+				{
+					AggPath *aggpath = (AggPath *)agg_path;
+
+					aggpath->hybrid = true;
+				}
+#endif
                 add_path(grouped_rel, agg_path);
 #ifdef __TBASE__
                 }
@@ -5432,8 +5583,13 @@ create_grouping_paths(PlannerInfo *root,
              * to sort above, then we'd better generate a Path, so that we at
              * least have one.
              */
+#ifdef __TBASE__
+			if (hashaggtablesize < work_mem * 1024L || g_hybrid_hash_agg ||
+				grouped_rel->pathlist == NIL)
+#else
             if (hashaggtablesize < work_mem * 1024L ||
                 grouped_rel->pathlist == NIL)
+#endif
             {
                 /* If the whole aggregate was pushed down, we're done. */
                 if (! can_push_down_grouping(root, parse, cheapest_path))
@@ -5453,6 +5609,14 @@ create_grouping_paths(PlannerInfo *root,
 
                     /* keep partially aggregated path for the can_sort branch */
                     agg_path = path;
+#ifdef __TBASE__
+					if (hashaggtablesize >= work_mem * 1024L && g_hybrid_hash_agg)
+					{
+						AggPath *aggpath = (AggPath *)agg_path;
+
+						aggpath->hybrid = true;
+					}
+#endif
 
 #ifdef __TBASE__
                     if (olap_optimizer && !has_cold_hot_table)
@@ -5482,7 +5646,14 @@ create_grouping_paths(PlannerInfo *root,
                                                  dNumGroups);
 
                         //agg_path->parallel_safe = true;
-                        
+#ifdef __TBASE__
+						if (hashaggtablesize >= work_mem * 1024L && g_hybrid_hash_agg)
+						{
+							AggPath *aggpath = (AggPath *)agg_path;
+
+							aggpath->hybrid = true;
+						}
+#endif
                         add_path(grouped_rel, agg_path);
                     }
 
